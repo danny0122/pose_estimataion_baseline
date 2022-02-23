@@ -86,11 +86,121 @@ def prepare_network(args, load_dir='', is_train=True):
 
 
 
-####################
-#
-#  train set / trainer code
-#
-####################
+def train_setup(model, checkpoint):    
+    criterion, optimizer, lr_scheduler = None, None, None
+    loss_history = {'total_loss': [], 'joint_loss': [], 'smpl_joint_loss': [], 'proj_loss': [], 'pose_param_loss': [], 'shape_param_loss': [], 'prior_loss': []}
+    error_history = {'mpjpe': [], 'pa_mpjpe': [], 'mpvpe': []}
+    
+    criterion = get_loss()
+    optimizer = get_optimizer(model=model)
+    lr_scheduler = get_scheduler(optimizer=optimizer)
+    #학습을 위한 loss/optimzer,lr schedule 설정
+
+
+    #체크포인트 불러오기
+    if checkpoint is not None:
+        optimizer.load_state_dict(checkpoint['optim_state_dict'])
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.cuda()
+        curr_lr = 0.0
+
+        for param_group in optimizer.param_groups:
+            curr_lr = param_group['lr']
+
+        lr_state = checkpoint['scheduler_state_dict']
+        lr_state['milestones'], lr_state['gamma'] = Counter(cfg.TRAIN.lr_step), cfg.TRAIN.lr_factor
+        lr_scheduler.load_state_dict(lr_state)
+
+        loss_history = checkpoint['train_log']
+        error_history = checkpoint['test_log']
+        cfg.TRAIN.begin_epoch = checkpoint['epoch'] + 1
+        logger.info("===> resume from epoch {:d}, current lr: {:.0e}, milestones: {}, lr factor: {:.0e}"
+                    .format(cfg.TRAIN.begin_epoch, curr_lr, lr_state['milestones'], lr_state['gamma']))
+
+    return criterion, optimizer, lr_scheduler, loss_history, error_history
+    
+
+class Trainer:
+    def __init__(self, args, load_dir):
+        self.model, checkpoint = prepare_network(args, load_dir, True)
+        self.loss, self.optimizer, self.lr_scheduler, self.loss_history, self.error_history = train_setup(self.model, checkpoint)
+        dataset_list, self.batch_generator = get_dataloader(cfg.DATASET.train_list, is_train=True)
+        
+        self.model = self.model.cuda()
+        self.model = nn.DataParallel(self.model) 
+        self.print_freq = cfg.TRAIN.print_freq
+        
+        self.joint_loss_weight = cfg.TRAIN.joint_loss_weight
+        self.proj_loss_weight = cfg.TRAIN.proj_loss_weight
+        self.pose_loss_weight = cfg.TRAIN.pose_loss_weight
+        self.shape_loss_weight = cfg.TRAIN.shape_loss_weight
+        self.prior_loss_weight = cfg.TRAIN.prior_loss_weight
+
+        
+    def train(self, epoch):
+        self.model.train()
+        lr = self.lr_scheduler.get_last_lr()[0]
+
+        running_loss = 0.0
+        running_joint_loss = 0.0
+        running_smpl_joint_loss = 0.0
+        running_proj_loss = 0.0
+        running_pose_param_loss = 0.0
+        running_shape_param_loss = 0.0
+        running_prior_loss = 0.0
+        
+        batch_generator = tqdm(self.batch_generator)
+        for i, batch in enumerate(batch_generator):
+            inp_img = batch['img'].cuda()
+            tar_joint_img, tar_joint_cam, tar_smpl_joint_cam = batch['joint_img'].cuda(), batch['joint_cam'].cuda(), batch['smpl_joint_cam'].cuda()
+            tar_pose, tar_shape = batch['pose'].cuda(), batch['shape'].cuda()
+            meta_joint_valid, meta_has_3D, meta_has_param = batch['joint_valid'].cuda(), batch['has_3D'].cuda(), batch['has_param'].cuda()
+            #cuda 설정
+            
+            #모델에 입력후 출력값 받아내기
+            pred_mesh_cam, pred_joint_cam, pred_joint_proj, pred_smpl_pose, pred_smpl_shape = self.model(inp_img)
+            
+
+            #6가지 loss 구하고 합치기
+            loss1 = self.joint_loss_weight * self.loss['joint_cam'](pred_joint_cam, tar_joint_cam, meta_joint_valid * meta_has_3D)
+            loss2 = self.joint_loss_weight * self.loss['smpl_joint_cam'](pred_joint_cam, tar_smpl_joint_cam, meta_has_param[:,:,None])
+            loss3 = self.proj_loss_weight * self.loss['joint_proj'](pred_joint_proj, tar_joint_img, meta_joint_valid)
+            loss4 = self.pose_loss_weight * self.loss['pose_param'](pred_smpl_pose, tar_pose, meta_has_param)
+            loss5 = self.shape_loss_weight * self.loss['shape_param'](pred_smpl_shape, tar_shape, meta_has_param)
+            loss6 = self.prior_loss_weight * self.loss['prior'](pred_smpl_pose[:,3:], pred_smpl_shape)
+            loss = loss1 + loss2 + loss3 + loss4 + loss5 + loss6
+            
+            # update weights
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            # log
+            loss, loss1, loss2, loss3, loss4, loss5, loss6 = loss.detach(), loss1.detach(), loss2.detach(), loss3.detach(), loss4.detach(), loss5.detach(), loss6.detach()
+            running_loss += float(loss.item())
+            running_joint_loss += float(loss1.item())
+            running_smpl_joint_loss += float(loss2.item())
+            running_proj_loss += float(loss3.item())
+            running_pose_param_loss += float(loss4.item())
+            running_shape_param_loss += float(loss5.item())
+            running_prior_loss += float(loss6.item())
+            
+            if i % self.print_freq == 0:
+                batch_generator.set_description(f'Epoch{epoch} ({i}/{len(batch_generator)}) => '
+                                                f'joint: {loss1:.4f} smpl_joint: {loss2:.4f} proj: {loss3:.4f} pose: {loss4:.4f}, shape: {loss5:.4f}, prior: {loss6:.4f}')
+
+        self.loss_history['total_loss'].append(running_loss / len(batch_generator)) 
+        self.loss_history['joint_loss'].append(running_joint_loss / len(batch_generator))     
+        self.loss_history['smpl_joint_loss'].append(running_smpl_joint_loss / len(batch_generator))     
+        self.loss_history['proj_loss'].append(running_proj_loss / len(batch_generator)) 
+        self.loss_history['pose_param_loss'].append(running_pose_param_loss / len(batch_generator)) 
+        self.loss_history['shape_param_loss'].append(running_shape_param_loss / len(batch_generator)) 
+        self.loss_history['prior_loss'].append(running_prior_loss / len(batch_generator)) 
+        
+        logger.info(f'Epoch{epoch} Loss: {self.loss_history["total_loss"][-1]:.4f}')
+
 
 
 

@@ -59,8 +59,12 @@ class Human36M(BaseDataset):
             assert 0, print("Unknown subset")
 
         return subject
-    
+
+
+
     def load_data(self):
+
+        """
         subject_list = self.get_subject()
         sampling_ratio = self.get_subsampling_ratio()
         
@@ -93,6 +97,44 @@ class Human36M(BaseDataset):
             else:
                 smpl_params = None
         
+        db.createIndex()
+        """
+
+        subject_list = self.get_subject()
+        sampling_ratio = self.get_subsampling_ratio()
+        
+        # data의 annotation json파일이 coco data format와 유사하게 되어있음(https://cocodataset.org/#format-data) 
+        # 이 annotation json파일에서 이미지의 여러 정보들을 읽음
+        db = COCO()  #pycocotools 라이브러리
+        cameras = {}
+        joints = {}
+        smpl_params = {}
+        for subject in subject_list:
+            # data load
+            # 데이터 폴더에 있는 annotation json 파일 읽는 과정
+            with open(osp.join(self.annot_path, f'Human36M_subject{subject}_data.json'),'r') as f:
+                annot = json.load(f)
+            if len(db.dataset) == 0:
+                for k,v in annot.items():
+                    db.dataset[k] = v
+            else:
+                for k,v in annot.items():
+                    db.dataset[k] += v
+            # camera load
+            with open(osp.join(self.annot_path, f'Human36M_subject{subject}_camera.json'),'r') as f:
+                cameras[str(subject)] = json.load(f)
+            # joint coordinate load
+            with open(osp.join(self.annot_path, f'Human36M_subject{subject}_joint_3d.json'),'r') as f:
+                joints[str(subject)] = json.load(f)
+            if cfg.TRAIN.use_pseudo_GT:
+                # smpl parameter load
+                with open(osp.join(self.annot_path, f'Human36M_subject{subject}_SMPL_NeuralAnnot.json'),'r') as f:
+                    smpl_params[str(subject)] = json.load(f)
+            else:
+                smpl_params = None
+        
+        #수동으로 직접 넣은 데이터를 사용해 db.anns/db.imgs를 정리 - anns에 indx를 넣으면 데이터가 나오도록
+        #https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocotools/coco.py
         db.createIndex()
         
         

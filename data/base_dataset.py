@@ -31,6 +31,7 @@ class BaseDataset(Dataset):
         return len(self.datalist)
 
     def __getitem__(self, index):
+        #깊은 복사 - 그냥 복사해버리면 복사한 배열에서 뭔가를 수정하면 원래 배열에 영향이 갈 수 도 있음
         data = copy.deepcopy(self.datalist[index])
         
         img_path = data['img_path']
@@ -53,7 +54,7 @@ class BaseDataset(Dataset):
             joint_cam = np.zeros((smpl.joint_num, 3))
             has_3D = np.array([0])
         
-        #augmentation 됬을 경우 그에 맞게 smpl pose의 루트 변경
+        #augmentation 됬을 경우 그에 맞게 smpl pose의 루트만 변경 / 나머지는 변하지 않음
         if self.has_smpl_param:
             smpl_pose, smpl_shape = smpl_param_processing(data['smpl_param'], data['cam_param'], do_flip, rot)
             mesh_cam, smpl_joint_cam = self.get_smpl_coord(smpl_pose, smpl_shape)
